@@ -22,6 +22,7 @@ pub(crate) const DEFAULT_FLUSH_METADATA_REGION_INTERVAL: Duration = Duration::fr
 
 /// Configuration for the metric engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct EngineConfig {
     /// The flush interval of the metadata region.
     #[serde(

@@ -405,6 +405,11 @@ skip_ssl_validation = false
 # endpoint = "https://storage.googleapis.com"
 
 ## The region engine options. You can configure multiple region engines.
+## Nested options can also be overridden through environment variables using the
+## documented double-underscore mapping, for example:
+## `GREPTIMEDB_DATANODE__REGION_ENGINE__MITO__GLOBAL_WRITE_BUFFER_REJECT_SIZE="4GB"`.
+## Overriding an engine's option through an environment variable keeps the other
+## default engines (`mito` + `file`) in place.
 [[region_engine]]
 
 ## The Mito engine options.

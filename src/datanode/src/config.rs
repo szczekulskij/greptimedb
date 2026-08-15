@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use common_base::readable_size::ReadableSize;
-use common_config::{Configurable, DEFAULT_DATA_HOME};
+use common_config::{Configurable, DEFAULT_DATA_HOME, ENV_VAR_SEP};
 use common_options::memory::MemoryOptions;
 pub use common_procedure::options::ProcedureConfig;
 use common_telemetry::logging::{LoggingOptions, TracingOptions};
@@ -88,6 +88,7 @@ pub struct DatanodeOptions {
     #[serde(with = "humantime_serde")]
     pub concurrent_query_limiter_timeout: Duration,
     /// Options for different store engines.
+    #[serde(deserialize_with = "deserialize_region_engine")]
     pub region_engine: Vec<RegionEngineConfig>,
     pub logging: LoggingOptions,
     pub enable_telemetry: bool,
@@ -173,6 +174,14 @@ impl Configurable for DatanodeOptions {
             "wal.broker_endpoints",
         ])
     }
+
+    fn apply_env_overrides(
+        &mut self,
+        env_prefix: &str,
+        config_file: Option<&str>,
+    ) -> common_config::error::Result<()> {
+        apply_region_engine_env_overrides(&mut self.region_engine, env_prefix, config_file)
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -184,6 +193,247 @@ pub enum RegionEngineConfig {
     File(FileEngineConfig),
     #[serde(rename = "metric")]
     Metric(MetricEngineConfig),
+}
+
+/// Applies environment variable overrides to `region_engine` configs.
+///
+/// Because `config-rs` cannot deep-merge an env-var-produced map into a
+/// TOML/JSON-produced sequence for the same key, this function performs a
+/// post-deserialization pass that reconstructs the correct field-level merge.
+///
+/// It re-runs a targeted config-rs merge for each engine with the following
+/// source ordering (later sources win):
+///
+///   defaults → env vars → config file
+///
+/// This means the **config file has the highest precedence**: TOML-specified
+/// fields always win over env vars. Env vars only fill in fields that the
+/// config file does not set, and everything else falls back to defaults.
+///
+/// When no config file is present (or the engine is not mentioned in it),
+/// the result is: env-var-specified fields take effect, all other fields
+/// receive their `Default` values.
+pub fn apply_region_engine_env_overrides(
+    region_engine: &mut [RegionEngineConfig],
+    env_prefix: &str,
+    config_file: Option<&str>,
+) -> common_config::error::Result<()> {
+    use common_config::error::{LoadLayeredConfigSnafu, SerdeJsonSnafu};
+    use config::{Config, Environment, File, FileFormat};
+    use snafu::ResultExt;
+
+    // Build the env var prefix for region engine keys.
+    // e.g. "GREPTIMEDB_DATANODE__REGION_ENGINE" or "UT_PREFIX__REGION_ENGINE"
+    let re_prefix = if env_prefix.is_empty() {
+        "REGION_ENGINE".to_string()
+    } else {
+        format!("{}{}{}", env_prefix, ENV_VAR_SEP, "REGION_ENGINE")
+    };
+
+    // Check if any env vars with this prefix exist; skip the work if not.
+    let has_region_engine_env =
+        std::env::vars().any(|(k, _)| k.to_uppercase().starts_with(&re_prefix.to_uppercase()));
+    if !has_region_engine_env {
+        return Ok(());
+    }
+
+    // If a config file is provided, parse it to extract the region_engine section
+    // as a TOML value map. We need the raw TOML so that only fields actually
+    // present in the file are used as overrides (fields absent from TOML don't
+    // appear, preserving the env var values for those).
+    let toml_engines: Option<toml::Value> = config_file.and_then(|path| {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                common_telemetry::warn!(
+                    "Failed to re-read config file for region_engine env override: {e}"
+                );
+                return None;
+            }
+        };
+        let table: toml::Value = match toml::from_str(&content) {
+            Ok(t) => t,
+            Err(e) => {
+                common_telemetry::warn!(
+                    "Failed to re-parse config file for region_engine env override: {e}"
+                );
+                return None;
+            }
+        };
+        table.get("region_engine").cloned()
+    });
+
+    for engine_cfg in region_engine.iter_mut() {
+        let engine_name = match engine_cfg {
+            RegionEngineConfig::Mito(_) => "mito",
+            RegionEngineConfig::File(_) => "file",
+            RegionEngineConfig::Metric(_) => "metric",
+        };
+
+        // The env prefix for this specific engine (uppercase).
+        // e.g. "GREPTIMEDB_DATANODE__REGION_ENGINE__MITO"
+        let engine_env_prefix =
+            format!("{}{}{}", re_prefix, ENV_VAR_SEP, engine_name.to_uppercase());
+
+        // Check if any env vars target this engine specifically.
+        let has_engine_env = std::env::vars().any(|(k, _)| {
+            k.to_uppercase().starts_with(&format!(
+                "{}{}",
+                engine_env_prefix.to_uppercase(),
+                ENV_VAR_SEP
+            ))
+        });
+        if !has_engine_env {
+            continue;
+        }
+
+        // Get the default config JSON for this engine.
+        let default_json = match engine_cfg {
+            RegionEngineConfig::Mito(_) => {
+                serde_json::to_string(&MitoConfig::default()).context(SerdeJsonSnafu)?
+            }
+            RegionEngineConfig::File(_) => {
+                serde_json::to_string(&FileEngineConfig::default()).context(SerdeJsonSnafu)?
+            }
+            RegionEngineConfig::Metric(_) => {
+                serde_json::to_string(&MetricEngineConfig::default()).context(SerdeJsonSnafu)?
+            }
+        };
+
+        let env_source = Environment::default()
+            .prefix(&engine_env_prefix)
+            .try_parsing(true)
+            .separator(ENV_VAR_SEP)
+            .ignore_empty(false);
+
+        // Extract the TOML-specified fields for this engine (if any).
+        // The TOML `[[region_engine]]` is an array of tables. Each element has a
+        // single key (the engine name) mapping to the engine's options.
+        let toml_json: Option<String> = toml_engines.as_ref().and_then(|engines| {
+            let arr = engines.as_array()?;
+            for entry in arr {
+                if let Some(engine_table) = entry.get(engine_name) {
+                    // Convert the TOML value to JSON for use as a config-rs source.
+                    return serde_json::to_string(engine_table).ok();
+                }
+            }
+            None
+        });
+
+        // Merge order (later wins): defaults → env vars → TOML (if present).
+        // TOML has the highest precedence; env vars only fill in fields that
+        // the config file does not specify.
+        let mut builder = Config::builder()
+            .add_source(File::from_str(&default_json, FileFormat::Json))
+            .add_source(env_source);
+
+        if let Some(ref toml_str) = toml_json {
+            builder = builder.add_source(File::from_str(toml_str, FileFormat::Json));
+        }
+
+        let merged = builder
+            .build()
+            .and_then(|c| match engine_cfg {
+                RegionEngineConfig::Mito(_) => c
+                    .try_deserialize::<MitoConfig>()
+                    .map(RegionEngineConfig::Mito),
+                RegionEngineConfig::File(_) => c
+                    .try_deserialize::<FileEngineConfig>()
+                    .map(RegionEngineConfig::File),
+                RegionEngineConfig::Metric(_) => c
+                    .try_deserialize::<MetricEngineConfig>()
+                    .map(RegionEngineConfig::Metric),
+            })
+            .context(LoadLayeredConfigSnafu)?;
+
+        *engine_cfg = merged;
+    }
+
+    Ok(())
+}
+
+/// Deserializes the `region_engine` option, accepting either the usual sequence
+/// form (from TOML array-of-tables, JSON arrays, or the default config source)
+/// or a map keyed by engine name.
+///
+/// The map form is what the layered environment-variable source produces for a
+/// path such as `GREPTIMEDB_STANDALONE__REGION_ENGINE__MITO__GLOBAL_WRITE_BUFFER_REJECT_SIZE`,
+/// which config-rs expands into `{ region_engine: { mito: { global_write_buffer_reject_size: "4GB" } } }`.
+/// Without this, startup fails with `invalid type: map, expected a sequence`.
+///
+/// When the map form is used, the default engine set (`mito` + `file`) is
+/// always preserved — overriding a field in one engine does not drop the other
+/// engines. Within an engine, fields not present in the map receive their
+/// `Default` values.
+pub fn deserialize_region_engine<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<RegionEngineConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use std::fmt;
+
+    use serde::de::{self, MapAccess, SeqAccess, Visitor};
+
+    struct RegionEngineVisitor;
+
+    impl<'de> Visitor<'de> for RegionEngineVisitor {
+        type Value = Vec<RegionEngineConfig>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str(
+                "a sequence of region engine configs, or a map keyed by engine name \
+                 (e.g. `mito`, `file`, `metric`)",
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut engines = Vec::new();
+            while let Some(engine) = seq.next_element::<RegionEngineConfig>()? {
+                engines.push(engine);
+            }
+            Ok(engines)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut mito: Option<MitoConfig> = None;
+            let mut file: Option<FileEngineConfig> = None;
+            let mut metric: Option<MetricEngineConfig> = None;
+
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "mito" => mito = Some(map.next_value()?),
+                    "file" => file = Some(map.next_value()?),
+                    "metric" => metric = Some(map.next_value()?),
+                    other => {
+                        return Err(de::Error::custom(format!(
+                            "unknown region engine `{other}`, expected one of `mito`, `file`, `metric`"
+                        )));
+                    }
+                }
+            }
+
+            // Preserve the default engine set (`mito` + `file`) and override only
+            // the engines specified through the map form. `metric` is only added
+            // when explicitly configured, matching the default engine set.
+            let mut engines = vec![
+                RegionEngineConfig::Mito(mito.unwrap_or_default()),
+                RegionEngineConfig::File(file.unwrap_or_default()),
+            ];
+            if let Some(metric) = metric {
+                engines.push(RegionEngineConfig::Metric(metric));
+            }
+            Ok(engines)
+        }
+    }
+
+    deserializer.deserialize_any(RegionEngineVisitor)
 }
 
 #[cfg(test)]

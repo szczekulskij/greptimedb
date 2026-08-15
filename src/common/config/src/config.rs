@@ -29,6 +29,12 @@ pub const ENV_LIST_SEP: &str = ",";
 pub trait Configurable: Serialize + DeserializeOwned + Default + Sized {
     /// Load the configuration from multiple sources and merge them.
     /// The precedence order is: config file > environment variables > default values.
+    ///
+    /// Note: [`Self::apply_env_overrides`] runs after deserialization to ensure
+    /// environment variables are correctly applied to fields that `config-rs`
+    /// cannot deep-merge automatically (e.g. `region_engine`). The standard
+    /// precedence (config file > env > defaults) is preserved.
+    ///
     /// `env_prefix` is the prefix of environment variables, e.g. "FRONTEND__xxx".
     /// The function will use dunder(double underscore) `__` as the separator for environment variables, for example:
     /// `DATANODE__STORAGE__MANIFEST__CHECKPOINT_MARGIN` will be mapped to `DatanodeOptions.storage.manifest.checkpoint_margin` field in the configuration.
@@ -78,9 +84,21 @@ pub trait Configurable: Serialize + DeserializeOwned + Default + Sized {
             .and_then(|x| x.try_deserialize())
             .context(LoadLayeredConfigSnafu)?;
 
+        opts.apply_env_overrides(env_prefix, config_file)?;
         opts.validate_sanitize()?;
 
         Ok(opts)
+    }
+
+    /// Apply environment variable overrides that cannot be handled by the
+    /// normal `config-rs` layered merge (e.g. `region_engine` where an env var
+    /// map cannot be deep-merged with a TOML/JSON array by config-rs).
+    ///
+    /// Called after deserialization with the same `env_prefix` and `config_file`
+    /// passed to [`Self::load_layered_options`]. The default implementation is
+    /// a no-op.
+    fn apply_env_overrides(&mut self, _env_prefix: &str, _config_file: Option<&str>) -> Result<()> {
+        Ok(())
     }
 
     /// Validate(and possibly sanitize) the configuration.

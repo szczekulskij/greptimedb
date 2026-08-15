@@ -19,7 +19,9 @@ use common_memory_manager::OnExhaustedPolicy;
 use common_options::memory::MemoryOptions;
 use common_telemetry::logging::{LoggingOptions, SlowQueryOptions, TracingOptions};
 use common_wal::config::DatanodeWalConfig;
-use datanode::config::{DatanodeOptions, ProcedureConfig, RegionEngineConfig, StorageConfig};
+use datanode::config::{
+    DatanodeOptions, ProcedureConfig, RegionEngineConfig, StorageConfig, deserialize_region_engine,
+};
 use file_engine::config::EngineConfig as FileEngineConfig;
 use flow::FlowConfig;
 use frontend::frontend::FrontendOptions;
@@ -65,6 +67,7 @@ pub struct StandaloneOptions {
     pub logging: LoggingOptions,
     pub user_provider: Option<String>,
     /// Options for different store engines.
+    #[serde(deserialize_with = "deserialize_region_engine")]
     pub region_engine: Vec<RegionEngineConfig>,
     pub tracing: TracingOptions,
     pub init_regions_in_background: bool,
@@ -125,6 +128,18 @@ impl Configurable for StandaloneOptions {
             "wal.broker_endpoints",
             "event_recorder.event_types",
         ])
+    }
+
+    fn apply_env_overrides(
+        &mut self,
+        env_prefix: &str,
+        config_file: Option<&str>,
+    ) -> common_config::error::Result<()> {
+        datanode::config::apply_region_engine_env_overrides(
+            &mut self.region_engine,
+            env_prefix,
+            config_file,
+        )
     }
 }
 
