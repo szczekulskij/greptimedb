@@ -4484,6 +4484,7 @@ dependencies = [
  "common-version",
  "common-wal",
  "common-workload",
+ "config",
  "dashmap",
  "datafusion",
  "datafusion-common",

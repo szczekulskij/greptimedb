@@ -65,6 +65,14 @@ where
     fn env_list_keys() -> Option<&'static [&'static str]> {
         T::env_list_keys()
     }
+
+    fn apply_env_overrides(
+        &mut self,
+        env_prefix: &str,
+        config_file: Option<&str>,
+    ) -> common_config::error::Result<()> {
+        self.component.apply_env_overrides(env_prefix, config_file)
+    }
 }
 
 /// A serde `deserialize_with` helper that parses the `plugins` field leniently.

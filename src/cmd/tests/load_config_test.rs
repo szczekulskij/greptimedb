@@ -490,3 +490,409 @@ fn test_load_metric_config_with_removed_sparse_primary_key_encoding() {
         Duration::from_secs(30)
     );
 }
+
+#[test]
+fn test_load_region_engine_mito_option_from_env() {
+    // Regression test for https://github.com/GreptimeTeam/greptimedb/issues/8620.
+    // `region_engine` is a `Vec<RegionEngineConfig>`, but the environment source
+    // expands `..REGION_ENGINE__MITO__GLOBAL_WRITE_BUFFER_REJECT_SIZE` into a map.
+    // The custom deserializer must accept the map form and override only the
+    // selected engine's nested option without dropping the other engines.
+    let env_prefix = "REGION_ENGINE_UT";
+    let env_key = [
+        env_prefix,
+        "REGION_ENGINE",
+        "MITO",
+        "GLOBAL_WRITE_BUFFER_REJECT_SIZE",
+    ]
+    .join(ENV_VAR_SEP);
+
+    temp_env::with_var(env_key, Some("4GB"), || {
+        // Standalone.
+        let standalone =
+            GreptimeOptions::<StandaloneOptions>::load_layered_options(None, env_prefix).unwrap();
+        assert_region_engine_reject_size(&standalone.component.region_engine, ReadableSize::gb(4));
+
+        // Datanode.
+        let datanode =
+            GreptimeOptions::<DatanodeOptions>::load_layered_options(None, env_prefix).unwrap();
+        assert_region_engine_reject_size(&datanode.component.region_engine, ReadableSize::gb(4));
+    });
+}
+
+fn assert_region_engine_reject_size(region_engine: &[RegionEngineConfig], expected: ReadableSize) {
+    let mito = region_engine
+        .iter()
+        .find_map(|c| match c {
+            RegionEngineConfig::Mito(c) => Some(c),
+            _ => None,
+        })
+        .expect("mito engine config should be present");
+    assert_eq!(mito.global_write_buffer_reject_size, expected);
+
+    // The other default engine (`file`) must still be present; overriding a
+    // single mito option must not drop it.
+    assert!(
+        region_engine
+            .iter()
+            .any(|c| matches!(c, RegionEngineConfig::File(_))),
+        "file engine config should be preserved"
+    );
+}
+
+#[test]
+fn test_load_region_engine_env_override_with_config_file() {
+    // Verify that the precedence `config file > env > defaults` is honored
+    // for region_engine sub-fields.
+    let env_prefix = "RE_OVERRIDE_UT";
+
+    // Env sets both reject_size AND auto_flush_interval.
+    let reject_size_key = [
+        env_prefix,
+        "REGION_ENGINE",
+        "MITO",
+        "GLOBAL_WRITE_BUFFER_REJECT_SIZE",
+    ]
+    .join(ENV_VAR_SEP);
+    let flush_interval_key =
+        [env_prefix, "REGION_ENGINE", "MITO", "AUTO_FLUSH_INTERVAL"].join(ENV_VAR_SEP);
+
+    // Config file sets auto_flush_interval (should win over env) but NOT reject_size.
+    let mut file = create_named_temp_file();
+    let toml_str = r#"
+        [[region_engine]]
+        [region_engine.mito]
+        auto_flush_interval = "1h"
+
+        [[region_engine]]
+        [region_engine.file]
+    "#;
+    write!(file, "{}", toml_str).unwrap();
+
+    temp_env::with_vars(
+        [
+            (reject_size_key, Some("4GB")),
+            (flush_interval_key, Some("99s")),
+        ],
+        || {
+            // Standalone.
+            let standalone = GreptimeOptions::<StandaloneOptions>::load_layered_options(
+                Some(file.path().to_str().unwrap()),
+                env_prefix,
+            )
+            .unwrap();
+            let mito = standalone
+                .component
+                .region_engine
+                .iter()
+                .find_map(|c| match c {
+                    RegionEngineConfig::Mito(c) => Some(c),
+                    _ => None,
+                })
+                .unwrap();
+            // Config file wins for auto_flush_interval (TOML=1h, env=99s → 1h).
+            assert_eq!(mito.auto_flush_interval, Duration::from_secs(3600));
+            // Env fills in reject_size (TOML didn't set it, env=4GB → 4GB).
+            assert_eq!(mito.global_write_buffer_reject_size, ReadableSize::gb(4));
+            // File engine must still be present.
+            assert!(
+                standalone
+                    .component
+                    .region_engine
+                    .iter()
+                    .any(|c| matches!(c, RegionEngineConfig::File(_)))
+            );
+
+            // Datanode.
+            let datanode = GreptimeOptions::<DatanodeOptions>::load_layered_options(
+                Some(file.path().to_str().unwrap()),
+                env_prefix,
+            )
+            .unwrap();
+            let mito = datanode
+                .component
+                .region_engine
+                .iter()
+                .find_map(|c| match c {
+                    RegionEngineConfig::Mito(c) => Some(c),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(mito.auto_flush_interval, Duration::from_secs(3600));
+            assert_eq!(mito.global_write_buffer_reject_size, ReadableSize::gb(4));
+        },
+    );
+}
+
+#[test]
+fn test_region_engine_config_file_wins_over_env_for_same_field() {
+    // When both TOML and env set the SAME field, TOML must win.
+    // All other fields must remain at their defaults.
+    let env_prefix = "RE_SAME_FIELD_UT";
+    let env_key = [
+        env_prefix,
+        "REGION_ENGINE",
+        "MITO",
+        "GLOBAL_WRITE_BUFFER_REJECT_SIZE",
+    ]
+    .join(ENV_VAR_SEP);
+
+    let mut file = create_named_temp_file();
+    let toml_str = r#"
+        [[region_engine]]
+        [region_engine.mito]
+        global_write_buffer_reject_size = "8GB"
+
+        [[region_engine]]
+        [region_engine.file]
+    "#;
+    write!(file, "{}", toml_str).unwrap();
+
+    temp_env::with_var(env_key, Some("4GB"), || {
+        let opts = GreptimeOptions::<DatanodeOptions>::load_layered_options(
+            Some(file.path().to_str().unwrap()),
+            env_prefix,
+        )
+        .unwrap();
+        let mito = opts
+            .component
+            .region_engine
+            .iter()
+            .find_map(|c| match c {
+                RegionEngineConfig::Mito(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+
+        let defaults = MitoConfig::default();
+        // TOML wins: 8GB, not the env's 4GB.
+        assert_eq!(mito.global_write_buffer_reject_size, ReadableSize::gb(8));
+        // Other fields remain at defaults.
+        assert_eq!(mito.auto_flush_interval, defaults.auto_flush_interval);
+        assert_eq!(
+            mito.global_write_buffer_size,
+            defaults.global_write_buffer_size
+        );
+        assert_eq!(mito.worker_channel_size, defaults.worker_channel_size);
+    });
+}
+
+#[test]
+fn test_region_engine_env_and_toml_different_fields_both_applied() {
+    // TOML sets field A, env sets field B (different fields).
+    // Both should be applied; everything else stays at defaults.
+    let env_prefix = "RE_DIFF_FIELDS_UT";
+    let env_key = [
+        env_prefix,
+        "REGION_ENGINE",
+        "MITO",
+        "GLOBAL_WRITE_BUFFER_SIZE",
+    ]
+    .join(ENV_VAR_SEP);
+
+    let mut file = create_named_temp_file();
+    let toml_str = r#"
+        [[region_engine]]
+        [region_engine.mito]
+        auto_flush_interval = "45m"
+
+        [[region_engine]]
+        [region_engine.file]
+    "#;
+    write!(file, "{}", toml_str).unwrap();
+
+    temp_env::with_var(env_key, Some("3GB"), || {
+        let opts = GreptimeOptions::<DatanodeOptions>::load_layered_options(
+            Some(file.path().to_str().unwrap()),
+            env_prefix,
+        )
+        .unwrap();
+        let mito = opts
+            .component
+            .region_engine
+            .iter()
+            .find_map(|c| match c {
+                RegionEngineConfig::Mito(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+
+        let defaults = MitoConfig::default();
+        // TOML-specified field applied.
+        assert_eq!(mito.auto_flush_interval, Duration::from_secs(45 * 60));
+        // Env-specified field applied.
+        assert_eq!(mito.global_write_buffer_size, ReadableSize::gb(3));
+        // Fields not set by either remain at defaults.
+        assert_eq!(
+            mito.global_write_buffer_reject_size,
+            defaults.global_write_buffer_reject_size
+        );
+        assert_eq!(mito.worker_channel_size, defaults.worker_channel_size);
+    });
+}
+
+#[test]
+fn test_region_engine_env_only_no_config_file_defaults_preserved() {
+    // No config file. Env sets one field. Everything else stays at defaults.
+    let env_prefix = "RE_ENV_ONLY_UT";
+    let env_key = [env_prefix, "REGION_ENGINE", "MITO", "WORKER_CHANNEL_SIZE"].join(ENV_VAR_SEP);
+
+    temp_env::with_var(env_key, Some("256"), || {
+        let opts =
+            GreptimeOptions::<DatanodeOptions>::load_layered_options(None, env_prefix).unwrap();
+        let mito = opts
+            .component
+            .region_engine
+            .iter()
+            .find_map(|c| match c {
+                RegionEngineConfig::Mito(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+
+        let defaults = MitoConfig::default();
+        // Env-specified field applied.
+        assert_eq!(mito.worker_channel_size, 256);
+        // Everything else stays at defaults.
+        assert_eq!(mito.auto_flush_interval, defaults.auto_flush_interval);
+        assert_eq!(
+            mito.global_write_buffer_reject_size,
+            defaults.global_write_buffer_reject_size
+        );
+        assert_eq!(
+            mito.global_write_buffer_size,
+            defaults.global_write_buffer_size
+        );
+        // File engine preserved.
+        assert!(
+            opts.component
+                .region_engine
+                .iter()
+                .any(|c| matches!(c, RegionEngineConfig::File(_)))
+        );
+    });
+}
+
+#[test]
+fn test_region_engine_multiple_engines_independent_overrides() {
+    // Env sets a mito field and a metric field. TOML sets a different mito field.
+    // Each engine is handled independently.
+    let env_prefix = "RE_MULTI_ENG_UT";
+    let mito_env_key = [
+        env_prefix,
+        "REGION_ENGINE",
+        "MITO",
+        "GLOBAL_WRITE_BUFFER_REJECT_SIZE",
+    ]
+    .join(ENV_VAR_SEP);
+    let metric_env_key = [
+        env_prefix,
+        "REGION_ENGINE",
+        "METRIC",
+        "FLUSH_METADATA_REGION_INTERVAL",
+    ]
+    .join(ENV_VAR_SEP);
+
+    let mut file = create_named_temp_file();
+    let toml_str = r#"
+        [[region_engine]]
+        [region_engine.mito]
+        auto_flush_interval = "2h"
+
+        [[region_engine]]
+        [region_engine.file]
+
+        [[region_engine]]
+        [region_engine.metric]
+    "#;
+    write!(file, "{}", toml_str).unwrap();
+
+    temp_env::with_vars(
+        [(mito_env_key, Some("6GB")), (metric_env_key, Some("120s"))],
+        || {
+            let opts = GreptimeOptions::<DatanodeOptions>::load_layered_options(
+                Some(file.path().to_str().unwrap()),
+                env_prefix,
+            )
+            .unwrap();
+
+            let defaults = MitoConfig::default();
+
+            // Mito: TOML sets auto_flush_interval, env sets reject_size.
+            let mito = opts
+                .component
+                .region_engine
+                .iter()
+                .find_map(|c| match c {
+                    RegionEngineConfig::Mito(c) => Some(c),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(mito.auto_flush_interval, Duration::from_secs(2 * 3600));
+            assert_eq!(mito.global_write_buffer_reject_size, ReadableSize::gb(6));
+            // Mito defaults preserved for other fields.
+            assert_eq!(
+                mito.global_write_buffer_size,
+                defaults.global_write_buffer_size
+            );
+
+            // Metric: TOML has empty metric section (no fields), env sets interval.
+            let metric = opts
+                .component
+                .region_engine
+                .iter()
+                .find_map(|c| match c {
+                    RegionEngineConfig::Metric(c) => Some(c),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                metric.flush_metadata_region_interval,
+                Duration::from_secs(120)
+            );
+
+            // File engine present and untouched.
+            assert!(
+                opts.component
+                    .region_engine
+                    .iter()
+                    .any(|c| matches!(c, RegionEngineConfig::File(_)))
+            );
+        },
+    );
+}
+
+#[test]
+fn test_region_engine_no_env_no_config_all_defaults() {
+    // Neither env nor config file: everything should be defaults.
+    let env_prefix = "RE_NO_OVERRIDE_UT";
+
+    let opts = GreptimeOptions::<DatanodeOptions>::load_layered_options(None, env_prefix).unwrap();
+    let mito = opts
+        .component
+        .region_engine
+        .iter()
+        .find_map(|c| match c {
+            RegionEngineConfig::Mito(c) => Some(c),
+            _ => None,
+        })
+        .unwrap();
+
+    let defaults = MitoConfig::default();
+    assert_eq!(mito.auto_flush_interval, defaults.auto_flush_interval);
+    assert_eq!(
+        mito.global_write_buffer_reject_size,
+        defaults.global_write_buffer_reject_size
+    );
+    assert_eq!(
+        mito.global_write_buffer_size,
+        defaults.global_write_buffer_size
+    );
+    assert_eq!(mito.worker_channel_size, defaults.worker_channel_size);
+    assert!(
+        opts.component
+            .region_engine
+            .iter()
+            .any(|c| matches!(c, RegionEngineConfig::File(_)))
+    );
+}
